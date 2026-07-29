@@ -45,6 +45,15 @@
     "BUSCMFFPS001VM (local)" -> BUSCMFFPS001VM). If it matches the local
     computer name, local cmdlets are used; otherwise remote CIM via WinRM.
 
+.PARAMETER PjlFallback
+    Optional. When a PJL-native laser vendor (HP, Lexmark, Brother, Kyocera,
+    Xerox, Ricoh, Canon) yields no model or serial via SNMP, probe the device
+    with "@PJL INFO ID" over TCP 9100. This recovers the ACTUAL printer's
+    model behind external JetDirect EX boxes, whose SNMP agent only describes
+    the box itself. Off by default: a pre-PJL device (e.g. an old dot-matrix
+    on a JetDirect EX parallel port) would print the probe as a garbage page.
+    The -TestIP diagnostic always attempts the PJL probe for these vendors.
+
 .PARAMETER TestIP
     Diagnostic mode. Test one IP and print the SNMP packets in hex.
 
@@ -87,6 +96,9 @@ param(
 
     [Parameter(ParameterSetName = 'Scan')]
     [string]$PrintServer,
+
+    [Parameter(ParameterSetName = 'Scan')]
+    [switch]$PjlFallback,
 
     [Parameter(Mandatory, ParameterSetName = 'Diagnose')]
     [string]$TestIP,
@@ -477,6 +489,124 @@ function Get-ZebraSerialViaSgd {
     return $null
 }
 
+# HP JetDirect: the IEEE 1284 device ID of the ATTACHED printer, cached by the
+# JetDirect from the parallel/USB handshake and exposed at HP enterprise OID
+# 1.3.6.1.4.1.11.2.3.9.1.1.7.0 (this is the OID CUPS uses for discovery).
+# Pure SNMP - no garbage-page risk - and works on v1-only JetDirect EX boxes.
+# Example value: "MFG:HP;CMD:PJL,PCL;MDL:LaserJet 4250;CLS:PRINTER;..."
+# Returns the raw device-ID string or $null. Tries v1 first (old EX boxes
+# drop v2c requests without answering).
+function Get-Hp1284DeviceId {
+    param([string]$IP, [string]$Community, [int]$TimeoutMs)
+    $oid = @(1, 3, 6, 1, 4, 1, 11, 2, 3, 9, 1, 1, 7, 0)
+    foreach ($ver in 0, 1) {
+        $r = Invoke-SnmpGet -Target $IP -Community $Community -OID $oid -Version $ver -TimeoutMs $TimeoutMs
+        if ($r.RecvBytes) {
+            $s = Parse-SnmpStringResponse $r.RecvBytes
+            if ($s -and $s -match ':') { return $s }
+        }
+    }
+    return $null
+}
+
+# Parses an IEEE 1284 device ID string into Make / Model / Serial.
+# Handles both short (MFG/MDL/SN) and long (MANUFACTURER/MODEL/SERIALNUMBER)
+# key forms, e.g. "MANUFACTURER:Lexmark International;MODEL:Lexmark C522".
+function Parse-Ieee1284DeviceId {
+    param([string]$DeviceId)
+    $out = @{ Make = ''; Model = ''; Serial = '' }
+    if (-not $DeviceId) { return $out }
+    foreach ($pair in ($DeviceId -split ';')) {
+        if ($pair -match '^\s*([^:]+):(.*)$') {
+            $key = $Matches[1].Trim().ToUpperInvariant()
+            $val = $Matches[2].Trim()
+            if (-not $val) { continue }
+            switch ($key) {
+                { $_ -in 'MFG', 'MANUFACTURER' }        { if (-not $out.Make)   { $out.Make   = $val } }
+                { $_ -in 'MDL', 'MODEL' }               { if (-not $out.Model)  { $out.Model  = $val } }
+                { $_ -in 'SN', 'SERN', 'SERIALNUMBER' } { if (-not $out.Serial) { $out.Serial = $val } }
+            }
+        }
+    }
+    # Normalize verbose manufacturer strings ("Hewlett-Packard" -> HP etc.)
+    if ($out.Make) {
+        $norm = Get-MakeFromDescription $out.Make
+        if ($norm -and $norm -ne 'Unknown') { $out.Make = $norm }
+    }
+    # Same vendor-boilerplate cleanup as the hrDeviceDescr path
+    if ($out.Model) {
+        $m = $out.Model -replace '(?i)^(Zebra(\s+Technologies)?\s+)?(ZTC\s+)?', ''
+        $m = $m -replace '(?i)\s+(ZPL|CPCL|EPL2?)\s*$', ''
+        $m = $m.Trim()
+        if ($m) { $out.Model = $m }
+    }
+    return $out
+}
+
+# PJL probe over TCP 9100:  @PJL INFO ID  (+ INFO CONFIG for a serial, if the
+# firmware reports one). Returns the model of the ACTUAL printer - essential
+# for external JetDirect EX boxes, whose SNMP agent only describes the box
+# itself, not the attached printer. PJL is a readback channel: PJL-capable
+# printers (HP LaserJet 4+, Lexmark, Brother, Kyocera, most lasers) answer
+# without printing anything.
+#
+# CAUTION: a pre-PJL device (old dot-matrix, PCL3-only inkjets) would treat
+# these bytes as a print job and emit a garbage page. Only call this for makes
+# known to speak PJL, and never for Zebras (they have SGD instead).
+# Returns @{ Model = <string>; Serial = <string> } or $null.
+function Get-PjlPrinterInfo {
+    param([string]$IP, [int]$TimeoutMs = 4000)
+    $client = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $iar = $client.BeginConnect($IP, 9100, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $null }
+        $client.EndConnect($iar)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = $TimeoutMs
+
+        $uel = [string][char]27 + '%-12345X'
+        $cmd = "$uel@PJL`r`n@PJL INFO ID`r`n@PJL INFO CONFIG`r`n$uel"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($cmd)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+
+        # Each INFO response ends with a form feed (0x0C); read until we've
+        # seen both or the deadline passes.
+        $sb       = [System.Text.StringBuilder]::new()
+        $buf      = New-Object byte[] 512
+        $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+        while ((Get-Date) -lt $deadline) {
+            try { $n = $stream.Read($buf, 0, $buf.Length) } catch { break }
+            if ($n -le 0) { break }
+            [void]$sb.Append([System.Text.Encoding]::ASCII.GetString($buf, 0, $n))
+            if (([regex]::Matches($sb.ToString(), "`f")).Count -ge 2) { break }
+        }
+        $raw = $sb.ToString()
+        if (-not $raw) { return $null }
+
+        $model = ''; $serial = ''
+
+        # Model: the line following "@PJL INFO ID", usually quoted.
+        if ($raw -match '(?s)@PJL INFO ID\s*[\r\n]+\s*"?([^"\r\n\f]+)') {
+            $model = $Matches[1].Trim()
+            # Brother-style "HL-L2360D series:84U-F75:Ver.b.26" -> keep model part
+            if ($model -match '^([^:]+):') { $model = $Matches[1].Trim() }
+        }
+
+        # Serial: some firmware includes it in INFO CONFIG output.
+        if ($raw -match '(?i)\bSERIAL\s*(?:NUMBER)?\s*=\s*"?([A-Za-z0-9\-]+)') {
+            $serial = $Matches[1].Trim()
+        }
+
+        if ($model -or $serial) { return @{ Model = $model; Serial = $serial } }
+    } catch {
+    } finally {
+        if ($client) { try { $client.Close() } catch {} }
+    }
+    return $null
+}
+
 # Best-effort vendor extraction from a sysDescr string.
 function Get-MakeFromDescription {
     param([string]$Description)
@@ -619,32 +749,67 @@ if ($PSCmdlet.ParameterSetName -eq 'Diagnose') {
 
     $make  = Get-MakeFromDescription $sysDescr
     $model = Get-ModelFromSnmp -HrDescr $hrDescr -SysDescr $sysDescr
-
-    Write-Host ""
-    Write-Host "--- Step 5: Serial number (vendor-aware OID chain) ---" -ForegroundColor Yellow
-    $serialResult = Get-PrinterSerialNumber -IP $TestIP -Community $SnmpCommunity -TimeoutMs ($SnmpTimeoutMs * 2) -Make $make
     $serial = $null
-    if ($serialResult) {
-        $serial = $serialResult.Serial
-        Write-Host "  Serial: $serial  (from OID $($serialResult.Oid))" -ForegroundColor Green
-    } else {
-        Write-Host "  No serial number returned from any known SNMP OID." -ForegroundColor Yellow
-        if ($make -eq 'Zebra') {
-            Write-Host ""
-            Write-Host "--- Step 5b: Zebra SGD fallback (TCP 9100, getvar device.unique_id) ---" -ForegroundColor Yellow
-            $serial = Get-ZebraSerialViaSgd -IP $TestIP -TimeoutMs ($SnmpTimeoutMs * 2)
-            if ($serial) {
-                Write-Host "  Serial: $serial  (via SGD over port 9100)" -ForegroundColor Green
-            } else {
-                Write-Host "  No response to SGD getvar either." -ForegroundColor Yellow
+
+    if ($make -eq 'HP' -and -not $model) {
+        Write-Host ""
+        Write-Host "--- Step 5: JetDirect 1284 device ID (SNMP 1.3.6.1.4.1.11.2.3.9.1.1.7.0) ---" -ForegroundColor Yellow
+        $devId = Get-Hp1284DeviceId -IP $TestIP -Community $SnmpCommunity -TimeoutMs ($SnmpTimeoutMs * 2)
+        if ($devId) {
+            Write-Host "  Raw device ID: $devId"
+            $p = Parse-Ieee1284DeviceId $devId
+            if ($p.Model)  { Write-Host "  Model : $($p.Model)  (via 1284 device ID)" -ForegroundColor Green; if (-not $model)  { $model  = $p.Model } }
+            if ($p.Serial) { Write-Host "  Serial: $($p.Serial)  (via 1284 device ID)" -ForegroundColor Green; $serial = $p.Serial }
+            if ($p.Make -and $p.Make -ne 'Unknown' -and $p.Make -ne $make) {
+                Write-Host "  Make corrected: $make -> $($p.Make) (attached printer differs from JetDirect box)" -ForegroundColor Green
+                $make = $p.Make
             }
+        } else {
+            Write-Host "  No 1284 device ID (very old ROM, or attached printer off/unidirectional)." -ForegroundColor Yellow
+        }
+    }
+
+    if (-not $serial) {
+        Write-Host ""
+        Write-Host "--- Step 6: Serial number (vendor-aware OID chain) ---" -ForegroundColor Yellow
+        $serialResult = Get-PrinterSerialNumber -IP $TestIP -Community $SnmpCommunity -TimeoutMs ($SnmpTimeoutMs * 2) -Make $make
+        if ($serialResult) {
+            $serial = $serialResult.Serial
+            Write-Host "  Serial: $serial  (from OID $($serialResult.Oid))" -ForegroundColor Green
+        } else {
+            Write-Host "  No serial number returned from any known SNMP OID." -ForegroundColor Yellow
+            if ($make -eq 'Zebra') {
+                Write-Host ""
+                Write-Host "--- Step 6b: Zebra SGD fallback (TCP 9100, getvar device.unique_id) ---" -ForegroundColor Yellow
+                $serial = Get-ZebraSerialViaSgd -IP $TestIP -TimeoutMs ($SnmpTimeoutMs * 2)
+                if ($serial) {
+                    Write-Host "  Serial: $serial  (via SGD over port 9100)" -ForegroundColor Green
+                } else {
+                    Write-Host "  No response to SGD getvar either." -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+
+    if ((-not $model -or -not $serial) -and $make -match '^(HP|Lexmark|Brother|Kyocera|Xerox|Ricoh|Canon)$') {
+        Write-Host ""
+        Write-Host "--- Step 7: PJL probe (TCP 9100, @PJL INFO ID) ---" -ForegroundColor Yellow
+        Write-Host "  Note: PJL-capable printers answer without printing; a pre-PJL device" -ForegroundColor DarkYellow
+        Write-Host "  attached to an external JetDirect box may print this probe as a page." -ForegroundColor DarkYellow
+        $pjl = Get-PjlPrinterInfo -IP $TestIP -TimeoutMs ($SnmpTimeoutMs * 2)
+        if ($pjl) {
+            if ($pjl.Model)  { Write-Host "  Model : $($pjl.Model)  (via PJL)" -ForegroundColor Green; if (-not $model)  { $model  = $pjl.Model } }
+            if ($pjl.Serial) { Write-Host "  Serial: $($pjl.Serial)  (via PJL INFO CONFIG)" -ForegroundColor Green; if (-not $serial) { $serial = $pjl.Serial } }
+            if (-not $pjl.Model -and -not $pjl.Serial) { Write-Host "  PJL responded but no usable fields parsed." -ForegroundColor Yellow }
+        } else {
+            Write-Host "  No PJL response (port closed, timeout, or non-PJL device)." -ForegroundColor Yellow
         }
     }
 
     Write-Host ""
     Write-Host "  Make  : $make"  -ForegroundColor Green
-    Write-Host "  Model : $(if ($model) { $model } else { '(not resolved via SNMP)' })" -ForegroundColor Green
-    Write-Host "  Serial: $(if ($serial) { $serial } else { '(not resolved via SNMP)' })" -ForegroundColor Green
+    Write-Host "  Model : $(if ($model) { $model } else { '(not resolved)' })" -ForegroundColor Green
+    Write-Host "  Serial: $(if ($serial) { $serial } else { '(not resolved)' })" -ForegroundColor Green
     return
 }
 
@@ -805,7 +970,7 @@ Write-Host "$($uniqueIps.Count) unique IP(s) to scan." -ForegroundColor Cyan
 # Worker scriptblock
 # ============================================================================
 $workerScript = {
-    param([string]$IP, [string]$Community, [int]$PingTimeout, [int]$SnmpTimeout, [string]$Code)
+    param([string]$IP, [string]$Community, [int]$PingTimeout, [int]$SnmpTimeout, [string]$Code, [bool]$UsePjl)
 
     Invoke-Expression $Code
 
@@ -817,6 +982,7 @@ $workerScript = {
         Description = ''
         Make        = ''
         Model       = ''
+        ModelSource = ''
         Serial      = ''
     }
 
@@ -866,16 +1032,56 @@ $workerScript = {
     if ($desc -or $r.Method -eq 'SNMP') {
         $hrDescr = Get-PrinterHrDeviceDescr -IP $IP -Community $Community -TimeoutMs $SnmpTimeout
         $r.Model = Get-ModelFromSnmp -HrDescr $hrDescr -SysDescr $desc
+        if ($r.Model) { $r.ModelSource = 'SNMP' }
         if (-not $r.Make -and $hrDescr) { $r.Make = Get-MakeFromDescription $hrDescr }
 
-        $serial = Get-PrinterSerialNumber -IP $IP -Community $Community -TimeoutMs $SnmpTimeout -Make $r.Make
-        if ($serial) {
-            $r.Serial = $serial.Serial
-        } elseif ($r.Make -eq 'Zebra') {
-            # Legacy ZebraNet units don't expose the printer serial via SNMP at
-            # all - fall back to SGD getvar over TCP 9100 (Zebra-only, safe).
-            $sgd = Get-ZebraSerialViaSgd -IP $IP -TimeoutMs $SnmpTimeout
-            if ($sgd) { $r.Serial = $sgd }
+        # 5. HP JetDirect 1284 device ID (pure SNMP, cheap): identifies the
+        # ACTUAL printer attached to a JetDirect - essential for external
+        # JetDirect EX boxes whose own MIB has no printer model. Can also
+        # correct the Make (non-HP printers are often attached to HP boxes),
+        # so this must run BEFORE the serial lookup, which routes by Make.
+        if ($r.Make -eq 'HP' -and (-not $r.Model -or -not $r.Serial)) {
+            $devId = Get-Hp1284DeviceId -IP $IP -Community $Community -TimeoutMs $SnmpTimeout
+            if ($devId) {
+                $p = Parse-Ieee1284DeviceId $devId
+                if (-not $r.Model -and $p.Model) {
+                    $r.Model = $p.Model
+                    $r.ModelSource = '1284ID'
+                }
+                if (-not $r.Serial -and $p.Serial) { $r.Serial = $p.Serial }
+                if ($p.Make -and $p.Make -ne 'Unknown') { $r.Make = $p.Make }
+            }
+        }
+
+        # 6. Serial number, routed by (possibly corrected) Make.
+        if (-not $r.Serial) {
+            $serial = Get-PrinterSerialNumber -IP $IP -Community $Community -TimeoutMs $SnmpTimeout -Make $r.Make
+            if ($serial) {
+                $r.Serial = $serial.Serial
+            } elseif ($r.Make -eq 'Zebra') {
+                # Legacy ZebraNet units don't expose the printer serial via SNMP
+                # at all - fall back to SGD getvar over TCP 9100 (Zebra-only,
+                # safe: ZPL firmware interprets or silently ignores SGD).
+                $sgd = Get-ZebraSerialViaSgd -IP $IP -TimeoutMs $SnmpTimeout
+                if ($sgd) { $r.Serial = $sgd }
+            }
+        }
+
+        # 7. Optional PJL probe (-PjlFallback): recovers the ACTUAL printer's
+        # model/serial behind external JetDirect EX boxes, whose SNMP agent
+        # only describes the box. Restricted to PJL-native laser vendors;
+        # never Zebra (SGD covers those) and never unknown makes, since
+        # pre-PJL hardware would print the probe as a garbage page.
+        if ($UsePjl -and (-not $r.Model -or -not $r.Serial) -and
+            $r.Make -match '^(HP|Lexmark|Brother|Kyocera|Xerox|Ricoh|Canon)$') {
+            $pjl = Get-PjlPrinterInfo -IP $IP -TimeoutMs ($SnmpTimeout * 2)
+            if ($pjl) {
+                if (-not $r.Model -and $pjl.Model) {
+                    $r.Model = $pjl.Model
+                    $r.ModelSource = 'PJL'
+                }
+                if (-not $r.Serial -and $pjl.Serial) { $r.Serial = $pjl.Serial }
+            }
         }
     }
 
@@ -899,6 +1105,7 @@ foreach ($ip in $uniqueIps) {
     [void]$ps.AddArgument($PingTimeoutMs)
     [void]$ps.AddArgument($SnmpTimeoutMs)
     [void]$ps.AddArgument($SnmpCode)
+    [void]$ps.AddArgument($PjlFallback.IsPresent)
     $ps.RunspacePool = $pool
     [void]$jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); IP = $ip })
 }
@@ -966,9 +1173,9 @@ $output = foreach ($row in $rows) {
     $qName = if ($nameColumn) { [string]$row.$nameColumn } else { '' }
     $drv   = if ($driverColumn) { [string]$row.$driverColumn } else { '' }
 
-    # Model: SNMP first, then queue-name hint, then driver name
+    # Model: SNMP/PJL first, then queue-name hint, then driver name
     $model       = if ($r -and $r.Model) { $r.Model } else { '' }
-    $modelSource = if ($model) { 'SNMP' } else { '' }
+    $modelSource = if ($model) { if ($r.ModelSource) { $r.ModelSource } else { 'SNMP' } } else { '' }
     if (-not $model) {
         $model = Get-ModelHintFromQueueName $qName
         if ($model) { $modelSource = 'QueueName' }

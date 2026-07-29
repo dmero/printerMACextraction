@@ -42,8 +42,10 @@ Serial numbers are the messy part. The script routes by vendor:
 | HP, Lexmark, Epson, Canon, most lasers | Printer-MIB (standard) | `1.3.6.1.2.1.43.5.1.1.17.1` |
 | Zebra Link-OS (ZT4xx, ZD4xx...) | Zebra private MIB | `1.3.6.1.4.1.10642.1.9.0` (+ two alternates) |
 | Zebra legacy / ZebraNet (GK420, GX420...) | SGD over TCP 9100 | `! U1 getvar "device.unique_id"` |
+| Printers attached to HP JetDirect boxes | IEEE 1284 device ID via SNMP (automatic) | `1.3.6.1.4.1.11.2.3.9.1.1.7.0` (MFG/MDL/SN fields) |
+| Lasers behind external JetDirect EX boxes | PJL over TCP 9100 (opt-in: `-PjlFallback`) | `@PJL INFO ID` / `INFO CONFIG` |
 
-The last one matters: **legacy ZebraNet firmware does not publish the printer's serial via SNMP at all** — its MIB describes the print server, not the printer. The script detects these (they identify as `ZebraNet Wired PS` and are v1-only) and queries the serial through Zebra's Set-Get-Do channel on the raw print port instead — the same mechanism Zebra Setup Utilities uses. This is only ever attempted against devices already confirmed as Zebras, since any other brand would treat those bytes as a print job.
+The last two matter: **legacy ZebraNet firmware does not publish the printer's serial via SNMP at all** — its MIB describes the print server, not the printer. Likewise, **external JetDirect EX boxes** (identifiable by `JETDIRECT EX` in sysDescr) only describe themselves; the attached printer is invisible to SNMP. The script reaches the actual printer through its port-9100 management channel instead: SGD for Zebras (automatic — Zebras interpret SGD, never print it) and PJL for laser vendors (opt-in via `-PjlFallback`, because a pre-PJL device on a JetDirect's parallel port would print the probe as a garbage page). The `-TestIP` diagnostic always attempts the PJL probe for laser vendors so you can validate per-device first.
 
 Note: `device.unique_id` defaults to the factory serial but is admin-settable. Spot-check one unit against its physical label before trusting a large batch.
 
@@ -54,6 +56,7 @@ Note: `device.unique_id` defaults to the factory serial but is admin-settable. S
 | `-InputPath` | *(required)* | .csv (Print Management export) or .xlsx (must contain an IP column) |
 | `-OutputPath` | `<input>_with_MAC.<ext>` | Output file; extension picks the format (.csv or .xlsx) |
 | `-PrintServer` | parsed from CSV | Server to query for queue→port→IP mapping (WinRM if remote) |
+| `-PjlFallback` | off | Probe PJL-native lasers via `@PJL INFO ID` (TCP 9100) when SNMP has no model/serial — recovers printers behind external JetDirect EX boxes |
 | `-TestIP` | — | Diagnostic mode: scan one device with full packet hex dumps |
 | `-SnmpCommunity` | `public` | SNMP read community string |
 | `-PingTimeoutMs` | `1000` | Per-host ping timeout |
